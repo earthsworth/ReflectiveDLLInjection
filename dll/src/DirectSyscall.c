@@ -70,14 +70,12 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 	SyscallList.dwCount = 0;
 
 	// STEP 1: Enumerate all functions exported from ntdll.dll that begin with "Zw".
-	// Store their hash and address in a temporary list.
 	for (DWORD dwIdxfName = 0; dwIdxfName < pExportDir->NumberOfNames; dwIdxfName++)
 	{
 		PCHAR FunctionName = (PCHAR)((PBYTE)pNtdllBase + pdwAddrOfNames[dwIdxfName]);
 		if (*(USHORT *)FunctionName == 0x775a) // "Zw" in little-endian
 		{
-			if (SyscallList.dwCount >= MAX_SYSCALLS)
-				break;
+			if (SyscallList.dwCount >= MAX_SYSCALLS) break;
 			SyscallList.Entries[SyscallList.dwCount].dwCryptedHash = _hash(FunctionName);
 			SyscallList.Entries[SyscallList.dwCount].pAddress = (PVOID)((PBYTE)pNtdllBase + pdwAddrOfFunctions[pwAddrOfNameOrdinales[dwIdxfName]]);
 			SyscallList.dwCount++;
@@ -85,7 +83,7 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 	}
 
 	// STEP 2: Sort the list of Zw* functions by their memory address.
-	// The index of a function in this sorted list is its true syscall number.
+	// The index 'i' of a function in this sorted list is its true syscall number. This holds for all architectures.
 	for (DWORD i = 0; i < SyscallList.dwCount - 1; i++)
 	{
 		for (DWORD j = 0; j < SyscallList.dwCount - i - 1; j++)
@@ -106,29 +104,29 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 		{
 			if (SyscallList.Entries[i].dwCryptedHash == Syscalls[dwIdxSyscall]->dwCryptedHash)
 			{
-				// The function's index 'i' in the sorted list is the syscall number.
-				Syscalls[dwIdxSyscall]->dwSyscallNr = i;
+				Syscalls[dwIdxSyscall]->dwSyscallNr = i; // The index is the true syscall number.
 
 #if defined(_M_ARM64)
-				// For ARM64, verify the function stub's opcode. Based on reverse engineering,
-				// the opcode for an unhooked 'svc' instruction can be predicted:
+				// For ARM64, we verify that the function's machine code matches the expected 'svc'
+				// instruction for the given syscall number. This ensures we have an authentic, unhooked stub.
+				// The formula was derived from reverse engineering ntdll.dll on Windows 11 ARM64.
 				DWORD expectedOpcode = 0xd4000001 + (i * 0x20);
 				if (*(PDWORD)SyscallList.Entries[i].pAddress == expectedOpcode)
 				{
-					// The "stub" our assembly will call is the function itself, as it
-					// already contains the correctly encoded 'svc' instruction.
+					// The "stub" to call is the function's address itself. The assembly
+					// trampoline will call this directly, executing the 'svc' instruction.
 					Syscalls[dwIdxSyscall]->pStub = SyscallList.Entries[i].pAddress;
 				}
 #else
-// For x86/x64, the "stub" is a pointer to the 'syscall; ret' gadget
-// inside the function, which is at a predictable offset.
-#if defined(_M_X64)
+				// For x86/x64, the "stub" is a pointer to the 'syscall; ret' gadget
+				// inside the function, which is at a predictable offset. This bypasses API hooks.
+				#if defined(_M_X64)
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 8);
-#else // _M_IX86
+				#else // _M_IX86
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 5);
+				#endif
 #endif
-#endif
-				break; // Found our function, move to the next required syscall.
+				break;
 			}
 		}
 	}

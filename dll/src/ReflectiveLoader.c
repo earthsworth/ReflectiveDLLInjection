@@ -25,6 +25,7 @@
 // OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 //===============================================================================================//
+
 #include "ReflectiveLoader.h"
 #include "DirectSyscall.c"
 
@@ -53,8 +54,9 @@ __declspec(noinline) ULONG_PTR caller(VOID)
 //                                     INTERNAL DEBUGGING CODES                                  //
 //===============================================================================================//
 #define RDI_ERR_BASE 0xE0000000
-#define RDI_ERR_FIND_IMAGE_BASE (RDI_ERR_BASE | 0x1000)
-#define RDI_ERR_RESOLVE_DEPS (RDI_ERR_BASE | 0x2000) // Generic dependency failure
+#define RDI_SUCCESS (0x00000001)
+#define RDI_ERR_FIND_IMAGE_BASE (RDI_ERR_BASE | 0x1000) 
+#define RDI_ERR_RESOLVE_DEPS (RDI_ERR_BASE | 0x2000)    // Generic dependency failure
 #define RDI_ERR_ALLOC_MEM (RDI_ERR_BASE | 0x3000)
 // Granular codes for dependency resolution:
 #define RDI_ERR_NO_KERNEL32 (RDI_ERR_BASE | 0x2100)		 // Failed to find kernel32.dll by hash
@@ -80,6 +82,7 @@ typedef struct
 	LOADLIBRARYA pLoadLibraryA;
 	GETPROCADDRESS pGetProcAddress;
 	PVOID pNtdllBase;
+	
 	Syscall ZwAllocateVirtualMemorySyscall;
 	Syscall ZwProtectVirtualMemorySyscall;
 	Syscall ZwFlushInstructionCacheSyscall;
@@ -113,7 +116,7 @@ static ULONG_PTR _find_image_base(VOID)
 }
 
 // STEP 1: Resolves all required functions and prepares for direct syscalls.
-static ULONG_PTR _resolve_dependencies(PLOADER_CONTEXT pContext)
+static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 {
 	ULONG_PTR uiBaseAddress;
 	ULONG_PTR uiValueA, uiValueB, uiValueC;
@@ -212,7 +215,7 @@ static ULONG_PTR _resolve_dependencies(PLOADER_CONTEXT pContext)
 	if (!getSyscalls(pContext->pNtdllBase, Syscalls, (sizeof(Syscalls) / sizeof(Syscalls[0]))))
 		return RDI_ERR_GETSYSCALLS_FAIL;
 
-	return TRUE; // Success
+	return RDI_SUCCESS; // Success
 }
 
 // STEP 2 & 3: Allocate memory for the new image and copy it over.
@@ -415,11 +418,29 @@ RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 #endif
 {
 	LOADER_CONTEXT context = {0};
-	context.ZwAllocateVirtualMemorySyscall = (Syscall){ZWALLOCATEVIRTUALMEMORY_HASH, 6};
-	context.ZwProtectVirtualMemorySyscall = (Syscall){ZWPROTECTVIRTUALMEMORY_HASH, 5};
-	context.ZwFlushInstructionCacheSyscall = (Syscall){ZWFLUSHINSTRUCTIONCACHE_HASH, 3};
+	Syscall tempSyscall;
+
+	// To ensure C/C++ compatibility and correct block-copy behavior, we create a
+	// temporary struct on the stack, populate it, and then assign it. This avoids
+	// C99 compound literals while producing functionally equivalent machine code.
+	tempSyscall.dwCryptedHash = ZWALLOCATEVIRTUALMEMORY_HASH;
+	tempSyscall.dwNumberOfArgs = 6;
+	tempSyscall.dwSyscallNr = 0; // Explicitly zero out remaining fields
+	tempSyscall.pStub = NULL;
+	context.ZwAllocateVirtualMemorySyscall = tempSyscall;
+
+	tempSyscall.dwCryptedHash = ZWPROTECTVIRTUALMEMORY_HASH;
+	tempSyscall.dwNumberOfArgs = 5;
+	context.ZwProtectVirtualMemorySyscall = tempSyscall;
+
+	tempSyscall.dwCryptedHash = ZWFLUSHINSTRUCTIONCACHE_HASH;
+	tempSyscall.dwNumberOfArgs = 3;
+	context.ZwFlushInstructionCacheSyscall = tempSyscall;
+
 #ifdef ENABLE_STOPPAGING
-	context.ZwLockVirtualMemorySyscall = (Syscall){ZWLOCKVIRTUALMEMORY_HASH, 4};
+	tempSyscall.dwCryptedHash = ZWLOCKVIRTUALMEMORY_HASH;
+	tempSyscall.dwNumberOfArgs = 4;
+	context.ZwLockVirtualMemorySyscall = tempSyscall;
 #endif
 
 	// STEP 0: Find our own image base in memory.
@@ -430,9 +451,9 @@ RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 	context.pNtHeaders = (PIMAGE_NT_HEADERS)(context.uiLibraryAddress + ((PIMAGE_DOS_HEADER)context.uiLibraryAddress)->e_lfanew);
 
 	// STEP 1: Resolve kernel32.dll/ntdll.dll functions and prepare for direct syscalls.
-	ULONG_PTR result = _resolve_dependencies(&context);
-	if (result != TRUE)
-		return _report_and_exit(result);
+	DWORD dwResolveResult = _resolve_dependencies(&context);
+	if (dwResolveResult != RDI_SUCCESS)
+		return _report_and_exit(dwResolveResult);
 
 	// STEP 2 & 3: Allocate a new permanent memory location and copy the image.
 	if (!_load_image_into_memory(&context))
