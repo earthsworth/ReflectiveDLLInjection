@@ -55,8 +55,8 @@ __declspec(noinline) ULONG_PTR caller(VOID)
 //===============================================================================================//
 #define RDI_ERR_BASE 0xE0000000
 #define RDI_SUCCESS (0x00000001)
-#define RDI_ERR_FIND_IMAGE_BASE (RDI_ERR_BASE | 0x1000) 
-#define RDI_ERR_RESOLVE_DEPS (RDI_ERR_BASE | 0x2000)    // Generic dependency failure
+#define RDI_ERR_FIND_IMAGE_BASE (RDI_ERR_BASE | 0x1000)
+#define RDI_ERR_RESOLVE_DEPS (RDI_ERR_BASE | 0x2000) // Generic dependency failure
 #define RDI_ERR_ALLOC_MEM (RDI_ERR_BASE | 0x3000)
 // Granular codes for dependency resolution:
 #define RDI_ERR_NO_KERNEL32 (RDI_ERR_BASE | 0x2100)		 // Failed to find kernel32.dll by hash
@@ -73,6 +73,18 @@ static ULONG_PTR _report_and_exit(DWORD dwErrorCode)
 //===============================================================================================//
 //                                      INTERNAL LOADER CONTEXT                                  //
 //===============================================================================================//
+// An enum to provide symbolic, compile-time-checked names for syscall array indices.
+typedef enum _SYSCALL_INDEX
+{
+	SyscallIndexAllocateVirtualMemory,
+	SyscallIndexProtectVirtualMemory,
+	SyscallIndexFlushInstructionCache,
+#ifdef ENABLE_STOPPAGING
+	SyscallIndexLockVirtualMemory,
+#endif
+	SyscallIndexMax
+} SYSCALL_INDEX;
+
 // A context structure to hold all state for the loader, improving readability.
 typedef struct
 {
@@ -82,13 +94,10 @@ typedef struct
 	LOADLIBRARYA pLoadLibraryA;
 	GETPROCADDRESS pGetProcAddress;
 	PVOID pNtdllBase;
-	
-	Syscall ZwAllocateVirtualMemorySyscall;
-	Syscall ZwProtectVirtualMemorySyscall;
-	Syscall ZwFlushInstructionCacheSyscall;
-#ifdef ENABLE_STOPPAGING
-	Syscall ZwLockVirtualMemorySyscall;
-#endif
+
+	// Centralized array for all required syscalls.
+	Syscall Syscalls[SyscallIndexMax];
+
 } LOADER_CONTEXT, *PLOADER_CONTEXT;
 
 //===============================================================================================//
@@ -126,11 +135,15 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 	BOOL bFoundKernel32 = FALSE;
 	BOOL bFoundNtdll = FALSE;
 
-#ifdef ENABLE_STOPPAGING
-	Syscall *Syscalls[] = {&pContext->ZwAllocateVirtualMemorySyscall, &pContext->ZwProtectVirtualMemorySyscall, &pContext->ZwFlushInstructionCacheSyscall, &pContext->ZwLockVirtualMemorySyscall};
-#else
-	Syscall *Syscalls[] = {&pContext->ZwAllocateVirtualMemorySyscall, &pContext->ZwProtectVirtualMemorySyscall, &pContext->ZwFlushInstructionCacheSyscall};
-#endif
+	// Create a temporary array of pointers to the Syscall structures in our context.
+	// This is required by the getSyscalls function signature. This approach makes
+	// adding new syscalls easier as this loop doesn't need to be changed.
+	Syscall *pSyscalls[SyscallIndexMax];
+	int i;
+	for (i = 0; i < SyscallIndexMax; ++i)
+	{
+		pSyscalls[i] = &pContext->Syscalls[i];
+	}
 
 	// Get the Process Environment Block (PEB) pointer in an architecture-specific way.
 #if defined(_M_X64)
@@ -212,7 +225,7 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 		return RDI_ERR_NO_EXPORTS;
 
 	// Now that we have ntdll, resolve our syscalls.
-	if (!getSyscalls(pContext->pNtdllBase, Syscalls, (sizeof(Syscalls) / sizeof(Syscalls[0]))))
+	if (!getSyscalls(pContext->pNtdllBase, pSyscalls, SyscallIndexMax))
 		return RDI_ERR_GETSYSCALLS_FAIL;
 
 	return RDI_SUCCESS; // Success
@@ -226,12 +239,12 @@ static BOOL _load_image_into_memory(PLOADER_CONTEXT pContext)
 
 	// Allocate memory using our direct syscall wrapper.
 	pContext->uiBaseAddress = 0;
-	if (rdiNtAllocateVirtualMemory(&pContext->ZwAllocateVirtualMemorySyscall, (HANDLE)-1, (PVOID *)&pContext->uiBaseAddress, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != 0)
+	if (rdiNtAllocateVirtualMemory(&pContext->Syscalls[SyscallIndexAllocateVirtualMemory], (HANDLE)-1, (PVOID *)&pContext->uiBaseAddress, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != 0)
 		return FALSE;
 
 #ifdef ENABLE_STOPPAGING
 	// Lock the memory to prevent it from being paged to disk. This is an optional hardening step.
-	rdiNtLockVirtualMemory(&pContext->ZwLockVirtualMemorySyscall, (HANDLE)-1, (PVOID *)&pContext->uiBaseAddress, &RegionSize, 1);
+	rdiNtLockVirtualMemory(&pContext->Syscalls[SyscallIndexLockVirtualMemory], (HANDLE)-1, (PVOID *)&pContext->uiBaseAddress, &RegionSize, 1);
 #endif
 
 	// Copy the PE headers from the original image to the newly allocated buffer.
@@ -387,7 +400,7 @@ static void _set_memory_protections(PLOADER_CONTEXT pContext)
 				dwProtect = PAGE_NOACCESS;
 		}
 
-		rdiNtProtectVirtualMemory(&pContext->ZwProtectVirtualMemorySyscall, (HANDLE)-1, (PVOID *)&uiValueB, &uiValueD, dwProtect, &dwOldProtect);
+		rdiNtProtectVirtualMemory(&pContext->Syscalls[SyscallIndexProtectVirtualMemory], (HANDLE)-1, (PVOID *)&uiValueB, &uiValueD, dwProtect, &dwOldProtect);
 	}
 }
 
@@ -397,7 +410,7 @@ static ULONG_PTR _call_entry_point(PLOADER_CONTEXT pContext, LPVOID lpParameter)
 	ULONG_PTR uiValueA = (pContext->uiBaseAddress + pContext->pNtHeaders->OptionalHeader.AddressOfEntryPoint);
 
 	// Flush the instruction cache to avoid executing stale code after relocations.
-	rdiNtFlushInstructionCache(&pContext->ZwFlushInstructionCacheSyscall, (HANDLE)-1, NULL, 0);
+	rdiNtFlushInstructionCache(&pContext->Syscalls[SyscallIndexFlushInstructionCache], (HANDLE)-1, NULL, 0);
 
 #ifdef REFLECTIVEDLLINJECTION_VIA_LOADREMOTELIBRARYR
 	((DLLMAIN)uiValueA)((HINSTANCE)pContext->uiBaseAddress, DLL_PROCESS_ATTACH, lpParameter);
@@ -418,29 +431,16 @@ RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 #endif
 {
 	LOADER_CONTEXT context = {0};
-	Syscall tempSyscall;
 
-	// To ensure C/C++ compatibility and correct block-copy behavior, we create a
-	// temporary struct on the stack, populate it, and then assign it. This avoids
-	// C99 compound literals while producing functionally equivalent machine code.
-	tempSyscall.dwCryptedHash = ZWALLOCATEVIRTUALMEMORY_HASH;
-	tempSyscall.dwNumberOfArgs = 6;
-	tempSyscall.dwSyscallNr = 0; // Explicitly zero out remaining fields
-	tempSyscall.pStub = NULL;
-	context.ZwAllocateVirtualMemorySyscall = tempSyscall;
-
-	tempSyscall.dwCryptedHash = ZWPROTECTVIRTUALMEMORY_HASH;
-	tempSyscall.dwNumberOfArgs = 5;
-	context.ZwProtectVirtualMemorySyscall = tempSyscall;
-
-	tempSyscall.dwCryptedHash = ZWFLUSHINSTRUCTIONCACHE_HASH;
-	tempSyscall.dwNumberOfArgs = 3;
-	context.ZwFlushInstructionCacheSyscall = tempSyscall;
-
+	// Initialize the Syscall structures in our context. We use C99 designated initializers
+	// for clarity and to ensure the correct fields are populated.
+	// The remaining fields (dwSyscallNr, pStub) are zero-initialized by the LOADER_CONTEXT
+	// initialization and will be populated later by getSyscalls().
+	context.Syscalls[SyscallIndexAllocateVirtualMemory] = (Syscall){.dwCryptedHash = ZWALLOCATEVIRTUALMEMORY_HASH, .dwNumberOfArgs = 6};
+	context.Syscalls[SyscallIndexProtectVirtualMemory] = (Syscall){.dwCryptedHash = ZWPROTECTVIRTUALMEMORY_HASH, .dwNumberOfArgs = 5};
+	context.Syscalls[SyscallIndexFlushInstructionCache] = (Syscall){.dwCryptedHash = ZWFLUSHINSTRUCTIONCACHE_HASH, .dwNumberOfArgs = 3};
 #ifdef ENABLE_STOPPAGING
-	tempSyscall.dwCryptedHash = ZWLOCKVIRTUALMEMORY_HASH;
-	tempSyscall.dwNumberOfArgs = 4;
-	context.ZwLockVirtualMemorySyscall = tempSyscall;
+	context.Syscalls[SyscallIndexLockVirtualMemory] = (Syscall){.dwCryptedHash = ZWLOCKVIRTUALMEMORY_HASH, .dwNumberOfArgs = 4};
 #endif
 
 	// STEP 0: Find our own image base in memory.
