@@ -1,3 +1,4 @@
+//===============================================================================================//
 // Copyright (c) 2013, Stephen Fewer of Harmony Security (www.harmonysecurity.com)
 // All rights reserved.
 //
@@ -25,6 +26,11 @@
 // POSSIBILITY OF SUCH DAMAGE.
 //===============================================================================================//
 #include "GetProcAddressR.h"
+
+// Disable Spectre mitigation warning for this sensitive, low-level code.
+#if _MSC_VER >= 1914
+#pragma warning(disable : 5045) // warning C5045: Compiler will insert Spectre mitigation for memory load if /Qspectre switch specified
+#endif
 
 FARPROC WINAPI GetProcAddressR(HANDLE hModule, LPCSTR lpProcName)
 {
@@ -63,8 +69,9 @@ FARPROC WINAPI GetProcAddressR(HANDLE hModule, LPCSTR lpProcName)
 	// The IS_INTRESOURCE macro checks if the high-word is zero.
 	if (((DWORD_PTR)lpProcName >> 16) == 0)
 	{
+		// ---- IMPORT BY ORDINAL ----
 		// The ordinal is the low-word of the lpProcName parameter.
-		WORD wOrdinal = (WORD)lpProcName;
+		WORD wOrdinal = LOWORD((DWORD_PTR)lpProcName);
 		DWORD dwOrdinalBase = pExportDirectory->Base;
 
 		// Check if the requested ordinal is within the valid range of exported functions.
@@ -83,6 +90,7 @@ FARPROC WINAPI GetProcAddressR(HANDLE hModule, LPCSTR lpProcName)
 	}
 	else
 	{
+		// ---- IMPORT BY NAME ----
 		// Iterate through the array of exported function names.
 		for (DWORD i = 0; i < pExportDirectory->NumberOfNames; i++)
 		{

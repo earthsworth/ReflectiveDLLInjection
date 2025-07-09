@@ -29,7 +29,13 @@
 #include "ReflectiveLoader.h"
 #include "DirectSyscall.c"
 
+// Our loader will set this to a pseudo correct HINSTANCE/HMODULE value
 HINSTANCE hAppInstance = NULL;
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4127) // conditional expression is constant
+#endif
 
 #ifdef __MINGW32__
 #define WIN_GET_CALLER() __builtin_extract_return_addr(__builtin_return_address(0))
@@ -82,6 +88,9 @@ typedef enum _SYSCALL_INDEX
 #ifdef ENABLE_STOPPAGING
 	SyscallIndexLockVirtualMemory,
 #endif
+	// This special value is used to keep track of the number of syscall indices and should
+	// always be the last element of the enum. Its value will equal the total count of
+	// syscalls required by the loader.
 	SyscallIndexMax
 } SYSCALL_INDEX;
 
@@ -103,6 +112,7 @@ typedef struct
 //===============================================================================================//
 //                                    INTERNAL HELPER FUNCTIONS                                  //
 //===============================================================================================//
+
 // STEP 0: Finds the loader's own image base in memory by searching backwards from the caller's address.
 static ULONG_PTR _find_image_base(VOID)
 {
@@ -128,10 +138,8 @@ static ULONG_PTR _find_image_base(VOID)
 static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 {
 	ULONG_PTR uiBaseAddress;
-	ULONG_PTR uiValueA, uiValueB, uiValueC;
 	USHORT usCounter;
 	DWORD dwHashValue;
-	ULONG_PTR uiExportDir, uiNameArray;
 	BOOL bFoundKernel32 = FALSE;
 	BOOL bFoundNtdll = FALSE;
 
@@ -139,8 +147,7 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 	// This is required by the getSyscalls function signature. This approach makes
 	// adding new syscalls easier as this loop doesn't need to be changed.
 	Syscall *pSyscalls[SyscallIndexMax];
-	int i;
-	for (i = 0; i < SyscallIndexMax; ++i)
+	for (int i = 0; i < SyscallIndexMax; ++i)
 	{
 		pSyscalls[i] = &pContext->Syscalls[i];
 	}
@@ -157,39 +164,42 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 #endif
 
 	// Navigate to the list of loaded modules.
+	// Ref: https://learn.microsoft.com/en-us/windows/win32/api/winternl/ns-winternl-peb_ldr_data
 	uiBaseAddress = (ULONG_PTR)((_PPEB)uiBaseAddress)->pLdr;
-	uiValueA = (ULONG_PTR)((PPEB_LDR_DATA)uiBaseAddress)->InMemoryOrderModuleList.Flink;
+
+	// Use a descriptive name for the list entry pointer.
+	ULONG_PTR pModuleListEntry = (ULONG_PTR)((PPEB_LDR_DATA)uiBaseAddress)->InMemoryOrderModuleList.Flink;
 
 	// Iterate through the loaded modules to find kernel32.dll and ntdll.dll by hash.
-	while (uiValueA)
+	while (pModuleListEntry)
 	{
-		PLDR_DATA_TABLE_ENTRY pLdrEntry = (PLDR_DATA_TABLE_ENTRY)uiValueA;
-		uiValueB = (ULONG_PTR)pLdrEntry->BaseDllName.pBuffer;
+		PLDR_DATA_TABLE_ENTRY pLdrEntry = (PLDR_DATA_TABLE_ENTRY)pModuleListEntry;
+
+		// Use descriptive names for hashing variables.
+		ULONG_PTR pModuleName = (ULONG_PTR)pLdrEntry->BaseDllName.pBuffer;
+		DWORD dwModuleHash = 0;
 		usCounter = pLdrEntry->BaseDllName.Length;
-		uiValueC = 0;
 
 		// Compute the hash of the module name.
 		do
 		{
-			uiValueC = ror((DWORD)uiValueC);
-			if (*((BYTE *)uiValueB) >= 'a')
-				uiValueC += *((BYTE *)uiValueB) - 0x20;
+			dwModuleHash = ror(dwModuleHash);
+			if (*((BYTE *)pModuleName) >= 'a')
+				dwModuleHash += *((BYTE *)pModuleName) - 0x20;
 			else
-				uiValueC += *((BYTE *)uiValueB);
-			uiValueB++;
+				dwModuleHash += *((BYTE *)pModuleName);
+			pModuleName++;
 		} while (--usCounter);
 
-		if ((DWORD)uiValueC == KERNEL32DLL_HASH)
+		if (dwModuleHash == KERNEL32DLL_HASH)
 		{
 			bFoundKernel32 = TRUE;
 			uiBaseAddress = (ULONG_PTR)pLdrEntry->DllBase;
 
 			// Parse the kernel32 export table to find LoadLibraryA and GetProcAddress.
-			uiExportDir = uiBaseAddress + ((PIMAGE_DOS_HEADER)uiBaseAddress)->e_lfanew;
-			uiNameArray = (ULONG_PTR) & ((PIMAGE_NT_HEADERS)uiExportDir)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-			uiExportDir = (uiBaseAddress + ((PIMAGE_DATA_DIRECTORY)uiNameArray)->VirtualAddress);
+			PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)(uiBaseAddress + ((PIMAGE_DOS_HEADER)uiBaseAddress)->e_lfanew);
+			PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)(uiBaseAddress + pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 
-			PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)uiExportDir;
 			PDWORD pdwNameArray = (PDWORD)(uiBaseAddress + pExportDir->AddressOfNames);
 			PWORD pwNameOrdinals = (PWORD)(uiBaseAddress + pExportDir->AddressOfNameOrdinals);
 			PDWORD pdwAddressArray = (PDWORD)(uiBaseAddress + pExportDir->AddressOfFunctions);
@@ -205,7 +215,7 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 					break;
 			}
 		}
-		else if ((DWORD)uiValueC == NTDLLDLL_HASH)
+		else if (dwModuleHash == NTDLLDLL_HASH)
 		{
 			bFoundNtdll = TRUE;
 			pContext->pNtdllBase = pLdrEntry->DllBase;
@@ -214,7 +224,7 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 		if (bFoundKernel32 && bFoundNtdll)
 			break;
 
-		uiValueA = DEREF(uiValueA);
+		pModuleListEntry = DEREF(pModuleListEntry);
 	}
 
 	if (!bFoundKernel32)
@@ -224,46 +234,43 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 	if (!pContext->pLoadLibraryA || !pContext->pGetProcAddress)
 		return RDI_ERR_NO_EXPORTS;
 
-	// Now that we have ntdll, resolve our syscalls.
 	if (!getSyscalls(pContext->pNtdllBase, pSyscalls, SyscallIndexMax))
 		return RDI_ERR_GETSYSCALLS_FAIL;
 
-	return RDI_SUCCESS; // Success
+	return RDI_SUCCESS;
 }
 
-// STEP 2 & 3: Allocate memory for the new image and copy it over.
 static BOOL _load_image_into_memory(PLOADER_CONTEXT pContext)
 {
-	ULONG_PTR uiValueA, uiValueB, uiValueC;
 	SIZE_T RegionSize = pContext->pNtHeaders->OptionalHeader.SizeOfImage;
 
-	// Allocate memory using our direct syscall wrapper.
 	pContext->uiBaseAddress = 0;
 	if (rdiNtAllocateVirtualMemory(&pContext->Syscalls[SyscallIndexAllocateVirtualMemory], (HANDLE)-1, (PVOID *)&pContext->uiBaseAddress, 0, &RegionSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) != 0)
 		return FALSE;
 
 #ifdef ENABLE_STOPPAGING
-	// Lock the memory to prevent it from being paged to disk. This is an optional hardening step.
+	// This call can fail on older systems (e.g. Server 2012) with
+	// STATUS_WORKING_SET_QUOTA, but this failure is not critical.
 	rdiNtLockVirtualMemory(&pContext->Syscalls[SyscallIndexLockVirtualMemory], (HANDLE)-1, (PVOID *)&pContext->uiBaseAddress, &RegionSize, 1);
 #endif
 
 	// Copy the PE headers from the original image to the newly allocated buffer.
-	uiValueA = pContext->pNtHeaders->OptionalHeader.SizeOfHeaders;
-	uiValueB = pContext->uiLibraryAddress;
-	uiValueC = pContext->uiBaseAddress;
-	while (uiValueA--)
-		*(BYTE *)uiValueC++ = *(BYTE *)uiValueB++;
+	DWORD dwSizeOfHeaders = pContext->pNtHeaders->OptionalHeader.SizeOfHeaders;
+	PBYTE pSourceBase = (PBYTE)pContext->uiLibraryAddress;
+	PBYTE pDestinationBase = (PBYTE)pContext->uiBaseAddress;
 
-	// Copy each PE section to its new virtual address.
-	PIMAGE_SECTION_HEADER pSectionHeader = (PIMAGE_SECTION_HEADER)((ULONG_PTR)&pContext->pNtHeaders->OptionalHeader + pContext->pNtHeaders->FileHeader.SizeOfOptionalHeader);
+	while (dwSizeOfHeaders--)
+		*pDestinationBase++ = *pSourceBase++;
+
+	PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pContext->pNtHeaders);
 	for (USHORT i = 0; i < pContext->pNtHeaders->FileHeader.NumberOfSections; i++, pSectionHeader++)
 	{
-		uiValueB = (pContext->uiBaseAddress + pSectionHeader->VirtualAddress);
-		uiValueC = (pContext->uiLibraryAddress + pSectionHeader->PointerToRawData);
-		ULONG_PTR uiValueD = pSectionHeader->SizeOfRawData;
+		PBYTE pDestination = (PBYTE)(pContext->uiBaseAddress + pSectionHeader->VirtualAddress);
+		PBYTE pSource = (PBYTE)(pContext->uiLibraryAddress + pSectionHeader->PointerToRawData);
+		DWORD dwSectionSize = pSectionHeader->SizeOfRawData;
 
-		while (uiValueD--)
-			*(BYTE *)uiValueB++ = *(BYTE *)uiValueC++;
+		while (dwSectionSize--)
+			*pDestination++ = *pSource++;
 	}
 
 	return TRUE;
@@ -324,46 +331,59 @@ static void _process_relocations(PLOADER_CONTEXT pContext)
 
 	PIMAGE_BASE_RELOCATION pBaseReloc = (PIMAGE_BASE_RELOCATION)(pContext->uiBaseAddress + pDataDirectory->VirtualAddress);
 
-	// Iterate through each relocation block.
 	for (; pBaseReloc->SizeOfBlock; pBaseReloc = (PIMAGE_BASE_RELOCATION)((ULONG_PTR)pBaseReloc + pBaseReloc->SizeOfBlock))
 	{
-		ULONG_PTR uiValueA = (pContext->uiBaseAddress + pBaseReloc->VirtualAddress);
-		ULONG uiValueBCount = (pBaseReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(IMAGE_RELOC);
+		ULONG_PTR pRelocationBlockBase = (pContext->uiBaseAddress + pBaseReloc->VirtualAddress);
+		ULONG uiEntryCount = (pBaseReloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(IMAGE_RELOC);
 		PIMAGE_RELOC pReloc = (PIMAGE_RELOC)((ULONG_PTR)pBaseReloc + sizeof(IMAGE_BASE_RELOCATION));
 
-		// Apply each relocation entry in the block.
-		for (ULONG i = 0; i < uiValueBCount; i++, pReloc++)
+		// Perform the relocation, skipping IMAGE_REL_BASED_ABSOLUTE as required.
+		// We don't use a switch statement to avoid the compiler building a jump table
+		// which would not be very position independent.
+		// Iterate through each relocation block.
+		for (ULONG i = 0; i < uiEntryCount; i++, pReloc++)
 		{
 			if (pReloc->type == IMAGE_REL_BASED_DIR64)
-				*(ULONG_PTR *)(uiValueA + pReloc->offset) += uiDelta;
+				*(ULONG_PTR *)((ULONG_PTR)pRelocationBlockBase + pReloc->offset) += uiDelta;
 			else if (pReloc->type == IMAGE_REL_BASED_HIGHLOW)
-				*(DWORD *)(uiValueA + pReloc->offset) += (DWORD)uiDelta;
+				*(DWORD *)((ULONG_PTR)pRelocationBlockBase + pReloc->offset) += (DWORD)uiDelta;
 #if defined(_M_ARM)
+			// Note: On ARM, the compiler optimization /O2 seems to introduce an off by one issue, possibly a code gen bug.
+			// Using /O1 instead avoids this problem.
 			else if (pReloc->type == IMAGE_REL_BASED_ARM_MOV32T)
 			{
 				// Handle 32-bit ARM-specific relocations for MOVW/MOVT instruction pairs.
-				DWORD dwInstruction = *(DWORD *)(uiValueA + pReloc->offset + sizeof(DWORD));
+				// This involves extracting and re-encoding a 16-bit immediate value.
+				// Get the MOV.T instruction's DWORD value (We add 4 to the offset to go past the first MOV.W which handles the low word).
+				DWORD dwInstruction = *(DWORD *)((ULONG_PTR)pRelocationBlockBase + pReloc->offset + sizeof(DWORD));
+				// Flip the words to get the instruction as expected (account for endianness/instruction packing).
 				dwInstruction = MAKELONG(HIWORD(dwInstruction), LOWORD(dwInstruction));
+				// Sanity check we are processing a MOVT instruction.
 				if ((dwInstruction & ARM_MOV_MASK) == ARM_MOVT)
 				{
+					// Pull out the encoded 16-bit immediate value (high portion of the address-to-relocate).
 					WORD wImm = (WORD)(dwInstruction & 0x000000FF);
 					wImm |= (WORD)((dwInstruction & 0x00007000) >> 4);
 					wImm |= (WORD)((dwInstruction & 0x04000000) >> 15);
 					wImm |= (WORD)((dwInstruction & 0x000F0000) >> 4);
+					// Apply the relocation delta to the target address.
 					DWORD dwAddress = ((WORD)HIWORD(uiDelta) + wImm) & 0xFFFF;
+					// Create a new instruction with the same opcode and register parameters.
 					dwInstruction &= ARM_MOV_MASK2;
+					// Patch in the relocated address, re-encoding the immediate value.
 					dwInstruction |= (DWORD)(dwAddress & 0x00FF);
 					dwInstruction |= (DWORD)(dwAddress & 0x0700) << 4;
 					dwInstruction |= (DWORD)(dwAddress & 0x0800) << 15;
 					dwInstruction |= (DWORD)(dwAddress & 0xF000) << 4;
-					*(DWORD *)(uiValueA + pReloc->offset + sizeof(DWORD)) = MAKELONG(HIWORD(dwInstruction), LOWORD(dwInstruction));
+					// Flip the instructions words and patch back into the code.
+					*(DWORD *)((ULONG_PTR)pRelocationBlockBase + pReloc->offset + sizeof(DWORD)) = MAKELONG(HIWORD(dwInstruction), LOWORD(dwInstruction));
 				}
 			}
 #endif
 			else if (pReloc->type == IMAGE_REL_BASED_HIGH)
-				*(WORD *)(uiValueA + pReloc->offset) += HIWORD(uiDelta);
+				*(WORD *)((ULONG_PTR)pRelocationBlockBase + pReloc->offset) += HIWORD(uiDelta);
 			else if (pReloc->type == IMAGE_REL_BASED_LOW)
-				*(WORD *)(uiValueA + pReloc->offset) += LOWORD(uiDelta);
+				*(WORD *)((ULONG_PTR)pRelocationBlockBase + pReloc->offset) += LOWORD(uiDelta);
 		}
 	}
 }
@@ -371,15 +391,17 @@ static void _process_relocations(PLOADER_CONTEXT pContext)
 // STEP 6: Set the correct memory protections on each section of the newly loaded image.
 static void _set_memory_protections(PLOADER_CONTEXT pContext)
 {
-	PIMAGE_SECTION_HEADER pSectionHeader = (PIMAGE_SECTION_HEADER)((ULONG_PTR)&pContext->pNtHeaders->OptionalHeader + pContext->pNtHeaders->FileHeader.SizeOfOptionalHeader);
+	PIMAGE_SECTION_HEADER pSectionHeader = IMAGE_FIRST_SECTION(pContext->pNtHeaders);
 	for (USHORT i = 0; i < pContext->pNtHeaders->FileHeader.NumberOfSections; i++, pSectionHeader++)
 	{
-		ULONG_PTR uiValueB = (pContext->uiBaseAddress + pSectionHeader->VirtualAddress);
-		SIZE_T uiValueD = pSectionHeader->Misc.VirtualSize;
+		PVOID pSectionBase = (PVOID)(pContext->uiBaseAddress + pSectionHeader->VirtualAddress);
+		SIZE_T dwSectionSize = pSectionHeader->Misc.VirtualSize;
 		DWORD dwProtect = 0, dwOldProtect;
+		// Characteristics processing courtesy of Dark Vort∑x, 2021-06-01
+		// See: https://bruteratel.com/research/feature-update/2021/06/01/PE-Reflection-Long-Live-The-King/
 		DWORD characteristics = pSectionHeader->Characteristics;
 
-		if (uiValueD == 0)
+		if (dwSectionSize == 0)
 			continue;
 
 		// Map PE section characteristics to Windows memory protection constants.
@@ -400,24 +422,27 @@ static void _set_memory_protections(PLOADER_CONTEXT pContext)
 				dwProtect = PAGE_NOACCESS;
 		}
 
-		rdiNtProtectVirtualMemory(&pContext->Syscalls[SyscallIndexProtectVirtualMemory], (HANDLE)-1, (PVOID *)&uiValueB, &uiValueD, dwProtect, &dwOldProtect);
+		rdiNtProtectVirtualMemory(&pContext->Syscalls[SyscallIndexProtectVirtualMemory], (HANDLE)-1, &pSectionBase, &dwSectionSize, dwProtect, &dwOldProtect);
 	}
 }
 
 // STEP 7 & 8: Call the image's entry point and return its address.
 static ULONG_PTR _call_entry_point(PLOADER_CONTEXT pContext, LPVOID lpParameter)
 {
-	ULONG_PTR uiValueA = (pContext->uiBaseAddress + pContext->pNtHeaders->OptionalHeader.AddressOfEntryPoint);
+	// Get the address of the entry point.
+	ULONG_PTR pEntryPoint = (pContext->uiBaseAddress + pContext->pNtHeaders->OptionalHeader.AddressOfEntryPoint);
 
 	// Flush the instruction cache to avoid executing stale code after relocations.
 	rdiNtFlushInstructionCache(&pContext->Syscalls[SyscallIndexFlushInstructionCache], (HANDLE)-1, NULL, 0);
 
+// If we are injecting a DLL via LoadRemoteLibraryR, we call DllMain and pass in our parameter (via the DllMain lpReserved parameter).
+// Otherwise, if we are injecting a DLL via a stub, we call DllMain with no parameter.
 #ifdef REFLECTIVEDLLINJECTION_VIA_LOADREMOTELIBRARYR
-	((DLLMAIN)uiValueA)((HINSTANCE)pContext->uiBaseAddress, DLL_PROCESS_ATTACH, lpParameter);
+	((DLLMAIN)pEntryPoint)((HINSTANCE)pContext->uiBaseAddress, DLL_PROCESS_ATTACH, lpParameter);
 #else
-	((DLLMAIN)uiValueA)((HINSTANCE)pContext->uiBaseAddress, DLL_PROCESS_ATTACH, NULL);
+	((DLLMAIN)pEntryPoint)((HINSTANCE)pContext->uiBaseAddress, DLL_PROCESS_ATTACH, NULL);
 #endif
-	return uiValueA;
+	return pEntryPoint;
 }
 
 //===============================================================================================//
@@ -478,6 +503,7 @@ RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 	);
 }
 //===============================================================================================//
+
 #ifndef REFLECTIVEDLLINJECTION_CUSTOM_DLLMAIN
 // Default DllMain if the user does not supply their own.
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD dwReason, LPVOID lpReserved)
@@ -499,4 +525,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD dwReason, LPVOID lpReserved)
 	}
 	return bReturnValue;
 }
+#endif
+
+#ifdef _MSC_VER
+#pragma warning(pop)
 #endif
