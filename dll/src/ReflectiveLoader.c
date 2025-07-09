@@ -167,7 +167,6 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 	// Ref: https://learn.microsoft.com/en-us/windows/win32/api/winternl/ns-winternl-peb_ldr_data
 	uiBaseAddress = (ULONG_PTR)((_PPEB)uiBaseAddress)->pLdr;
 
-	// Use a descriptive name for the list entry pointer.
 	ULONG_PTR pModuleListEntry = (ULONG_PTR)((PPEB_LDR_DATA)uiBaseAddress)->InMemoryOrderModuleList.Flink;
 
 	// Iterate through the loaded modules to find kernel32.dll and ntdll.dll by hash.
@@ -175,7 +174,6 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 	{
 		PLDR_DATA_TABLE_ENTRY pLdrEntry = (PLDR_DATA_TABLE_ENTRY)pModuleListEntry;
 
-		// Use descriptive names for hashing variables.
 		ULONG_PTR pModuleName = (ULONG_PTR)pLdrEntry->BaseDllName.pBuffer;
 		DWORD dwModuleHash = 0;
 		usCounter = pLdrEntry->BaseDllName.Length;
