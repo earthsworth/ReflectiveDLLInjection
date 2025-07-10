@@ -454,35 +454,30 @@ RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 #endif
 {
 	LOADER_CONTEXT context = {0};
+	// Create a single, zero-initialized template struct using legal syntax.
+	// This is portable to both C and C++ compilers.
+	static const Syscall zeroed_syscall = { 0 };
 
 	// Initialize the Syscall structures in our context.
-	// We use explicit member assignment instead of C99 designated initializers
-	// to maintain compatibility with C++ compilers (pre-C++20), which do not
-	// support this feature. The entire struct is first zero-initialized.
-	context.Syscalls[SyscallIndexAllocateVirtualMemory] = (Syscall){0};
+	// We assign a pre-zeroed struct to ensure portability across C/C++
+	// compilers, avoiding non-standard C99 compound literals or illegal
+	// initializer-list assignments.
+	context.Syscalls[SyscallIndexAllocateVirtualMemory] = zeroed_syscall;
 	context.Syscalls[SyscallIndexAllocateVirtualMemory].dwCryptedHash = ZWALLOCATEVIRTUALMEMORY_HASH;
 	context.Syscalls[SyscallIndexAllocateVirtualMemory].dwNumberOfArgs = 6;
-	context.Syscalls[SyscallIndexAllocateVirtualMemory].dwSyscallNr = 0; // Explicitly zeroed for clarity
-	context.Syscalls[SyscallIndexAllocateVirtualMemory].pStub = NULL;	 // Explicitly zeroed for clarity
 
-	context.Syscalls[SyscallIndexProtectVirtualMemory] = (Syscall){0};
+	context.Syscalls[SyscallIndexProtectVirtualMemory] = zeroed_syscall;
 	context.Syscalls[SyscallIndexProtectVirtualMemory].dwCryptedHash = ZWPROTECTVIRTUALMEMORY_HASH;
 	context.Syscalls[SyscallIndexProtectVirtualMemory].dwNumberOfArgs = 5;
-	context.Syscalls[SyscallIndexProtectVirtualMemory].dwSyscallNr = 0;
-	context.Syscalls[SyscallIndexProtectVirtualMemory].pStub = NULL;
 
-	context.Syscalls[SyscallIndexFlushInstructionCache] = (Syscall){0};
+	context.Syscalls[SyscallIndexFlushInstructionCache] = zeroed_syscall;
 	context.Syscalls[SyscallIndexFlushInstructionCache].dwCryptedHash = ZWFLUSHINSTRUCTIONCACHE_HASH;
 	context.Syscalls[SyscallIndexFlushInstructionCache].dwNumberOfArgs = 3;
-	context.Syscalls[SyscallIndexFlushInstructionCache].dwSyscallNr = 0;
-	context.Syscalls[SyscallIndexFlushInstructionCache].pStub = NULL;
 
 #ifdef ENABLE_STOPPAGING
-	context.Syscalls[SyscallIndexLockVirtualMemory] = (Syscall){0};
+	context.Syscalls[SyscallIndexLockVirtualMemory] = zeroed_syscall;
 	context.Syscalls[SyscallIndexLockVirtualMemory].dwCryptedHash = ZWLOCKVIRTUALMEMORY_HASH;
 	context.Syscalls[SyscallIndexLockVirtualMemory].dwNumberOfArgs = 4;
-	context.Syscalls[SyscallIndexLockVirtualMemory].dwSyscallNr = 0;
-	context.Syscalls[SyscallIndexLockVirtualMemory].pStub = NULL;
 #endif
 
 	// STEP 0: Find our own image base in memory.
