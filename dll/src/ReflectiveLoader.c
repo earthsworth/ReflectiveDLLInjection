@@ -195,9 +195,23 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 			uiBaseAddress = (ULONG_PTR)pLdrEntry->DllBase;
 
 			// Parse the kernel32 export table to find LoadLibraryA and GetProcAddress.
+			// We must correctly handle both 32-bit and 64-bit PE headers.
 			PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)(uiBaseAddress + ((PIMAGE_DOS_HEADER)uiBaseAddress)->e_lfanew);
-			PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)(uiBaseAddress + pNtHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+			ULONG_PTR uiExportDirRva = 0;
 
+			if (pNtHeaders->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+			{
+				// 64-bit PE header
+				uiExportDirRva = ((PIMAGE_NT_HEADERS64)pNtHeaders)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+			}
+			else
+			{
+				// 32-bit PE header
+				uiExportDirRva = ((PIMAGE_NT_HEADERS32)pNtHeaders)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+			}
+
+			PIMAGE_EXPORT_DIRECTORY pExportDir = (PIMAGE_EXPORT_DIRECTORY)(uiBaseAddress + uiExportDirRva);
+ 
 			PDWORD pdwNameArray = (PDWORD)(uiBaseAddress + pExportDir->AddressOfNames);
 			PWORD pwNameOrdinals = (PWORD)(uiBaseAddress + pExportDir->AddressOfNameOrdinals);
 			PDWORD pdwAddressArray = (PDWORD)(uiBaseAddress + pExportDir->AddressOfFunctions);
@@ -447,8 +461,11 @@ static ULONG_PTR _call_entry_point(PLOADER_CONTEXT pContext, LPVOID lpParameter)
 //                                         PUBLIC LOADER                                         //
 //===============================================================================================//
 // This is our position independent reflective DLL loader/injector
+// On 32-bit systems, the default __stdcall convention causes name mangling (_FunctionName@Bytes).
+// By explicitly declaring the loader as __cdecl, we ensure the name is exported simply
+// as "ReflectiveLoader" on all platforms, which is what the injector expects.
 #ifdef REFLECTIVEDLLINJECTION_VIA_LOADREMOTELIBRARYR
-RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(LPVOID lpParameter)
+RDIDLLEXPORT ULONG_PTR __cdecl ReflectiveLoader(LPVOID lpParameter)
 #else
 RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 #endif
@@ -456,12 +473,12 @@ RDIDLLEXPORT ULONG_PTR WINAPI ReflectiveLoader(VOID)
 	// NOTE:    Using SecureZeroMemory instead of `LOADER_CONTEXT context = { 0 }` because of segmentfault in metsrv.
 	// DETAILS: Under the hood, MSVC zeros the structure with a memset call, for some reason this is crashing sometimes.
 	//          The bug is build-specific, meaning compiling the same source may result in having or not having this bug.
-        //          Also, this seems to be happening only on metsrv, where probably we are calling the ReflectiveLoader in hacky
-        //          context. using SecureZeroMemory avoid calling memset and performs the zero setting inplace.
+	//          Also, this seems to be happening only on metsrv, where probably we are calling the ReflectiveLoader in hacky
+	//          context. using SecureZeroMemory avoid calling memset and performs the zero setting inplace.
 
 	LOADER_CONTEXT context;
 	SecureZeroMemory(&context, sizeof(LOADER_CONTEXT));
-	
+
 	context.Syscalls[SyscallIndexAllocateVirtualMemory].dwCryptedHash = ZWALLOCATEVIRTUALMEMORY_HASH;
 	context.Syscalls[SyscallIndexAllocateVirtualMemory].dwNumberOfArgs = 6;
 

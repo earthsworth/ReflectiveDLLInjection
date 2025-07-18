@@ -140,13 +140,13 @@ BOOL getSyscalls(PVOID pNtdllBase, Syscall *Syscalls[], DWORD dwSyscallSize)
 				//   C3              ret
 				// The gadget we jump to is at +8 bytes from the start.
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 8);
-#else // _M_IX86
-				// On x86, the function starts like this:
+#elif defined(_M_IX86)
+				// On x86, the stub often looks like:
 				//   B8 <num>..      mov eax, <syscall_num>
 				//   BA <ptr>..      mov edx, <syscall_dispatch_ptr>
-				//   FF D2           call edx
-				//   C2 0400         ret 4
-				// In ntdll, the call edx points to the 'syscall' instruction. The gadget is at +5 bytes.
+				//   FF D2           call edx  <-- This call is 5 bytes.
+				// The 'call' instruction itself is used as our gadget. Our trampoline will 'ret'
+				// to this location, effectively executing the call to the syscall dispatcher.
 				Syscalls[dwIdxSyscall]->pStub = (PVOID)((PBYTE)SyscallList.Entries[i].pAddress + 5);
 #endif
 #endif
