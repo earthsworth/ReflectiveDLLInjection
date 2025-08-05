@@ -143,14 +143,20 @@ static DWORD _resolve_dependencies(PLOADER_CONTEXT pContext)
 	BOOL bFoundKernel32 = FALSE;
 	BOOL bFoundNtdll = FALSE;
 
-	// Create a temporary array of pointers to the Syscall structures in our context.
-	// This is required by the getSyscalls function signature. This approach makes
-	// adding new syscalls easier as this loop doesn't need to be changed.
+	// X plicitly allocate a temporary array of pointers to the Syscall entries in our context.
+	// P rovide this array to satisfy the getSyscalls function signature.
+	// S uppress compiler-driven vectorization by explicitly unrolling the loop.
+	// U tilize simple MOV instructions to eliminate 16-byte alignment requirements on 32-bit stacks.
+	// C onsider constrained loader execution environments (e.g., within Meterpreter) where alignment isn’t guaranteed.
+	// K eep manual assignments to prevent emission of SSE MOVAPS instructions.
+	// S afeguard Windows XP builds against potential general protection faults.
 	Syscall *pSyscalls[SyscallIndexMax];
-	for (int i = 0; i < SyscallIndexMax; ++i)
-	{
-		pSyscalls[i] = &pContext->Syscalls[i];
-	}
+	pSyscalls[SyscallIndexAllocateVirtualMemory] = &pContext->Syscalls[SyscallIndexAllocateVirtualMemory];
+	pSyscalls[SyscallIndexProtectVirtualMemory] = &pContext->Syscalls[SyscallIndexProtectVirtualMemory];
+	pSyscalls[SyscallIndexFlushInstructionCache] = &pContext->Syscalls[SyscallIndexFlushInstructionCache];
+	#ifdef ENABLE_STOPPAGING
+		pSyscalls[SyscallIndexLockVirtualMemory] = &pContext->Syscalls[SyscallIndexLockVirtualMemory];
+	#endif
 
 	// Get the Process Environment Block (PEB) pointer in an architecture-specific way.
 #if defined(_M_X64)
